@@ -17,6 +17,7 @@
     using System.Security;
     using System.Text;
     using System.Threading.Tasks;
+    using System.Xml;
 
     public class WebApi : IWebApi
     {
@@ -69,7 +70,7 @@
         public async Task<OrganizationResponse> Send(OrganizationRequest request)
         {
             var message = await ToHttpRequest(request);
-            var result = _client.SendAsync(message).Result;
+            var result = await _client.SendAsync(message);
             return ToOrgResponse(request, result);
         }
 
@@ -147,20 +148,7 @@
                 }
                 case RetrieveMultipleRequest request:
                 {
-                    if (request.Query is QueryExpression query)
-                    {
-                        var metadata = await GetEntityMetadata(query.EntityName);
-                        var entity = metadata.LogicalCollectionName;
-
-                        var visitor = new ODataQueryExpressionVisitor();
-                        visitor.Visit(query);
-
-                        return new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/{entity}?{visitor.QueryString}");
-                    }
-                    else
-                    {
-                        throw new NotSupportedException("Query type is not supported.");
-                    }
+                    return await QueryToHttpRequest(request.Query);
                 }
                 case DeleteRequest request:
                 {
@@ -173,11 +161,65 @@
             return null;
         }
 
+        private async Task<HttpRequestMessage> QueryToHttpRequest(QueryBase queryBase)
+        {
+            switch (queryBase)
+            {
+                case FetchExpression query:
+                {
+                    using (var input = new StringReader(query.Query))
+                    using (var reader = XmlReader.Create(input))
+                    {
+                        reader.ReadToFollowing("entity");
+                        var entityName = reader.GetAttribute("name");
+
+                        var metadata = await GetEntityMetadata(entityName);
+                        var entity = metadata.LogicalCollectionName;
+
+                        return new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/{entity}?fetchXml={query.Query}");
+                    }
+                }
+                case QueryExpression query:
+                {
+                    var metadata = await GetEntityMetadata(query.EntityName);
+                    var entity = metadata.LogicalCollectionName;
+
+                    var visitor = new ODataQueryExpressionVisitor();
+                    visitor.Visit(query);
+
+                    return new HttpRequestMessage(HttpMethod.Get, $"{_baseUrl}/{entity}?{visitor.QueryString}");
+                }
+                case QueryByAttribute query:
+                {
+                    var queryExpression = new QueryExpression(query.EntityName)
+                    {
+                        TopCount = query.TopCount,
+                        PageInfo = query.PageInfo,
+                        ColumnSet = query.ColumnSet
+                    };
+                    queryExpression.Orders.AddRange(query.Orders);
+
+                    for (var i = 0; i < query.Attributes.Count; i++)
+                    {
+                        var attribute = query.Attributes[i];
+                        var value = query.Values[i];
+                        queryExpression.Criteria.AddCondition(attribute, ConditionOperator.Equal, value);
+                    }
+
+                    return await QueryToHttpRequest(queryExpression);
+                }
+                default:
+                {
+                    throw new NotSupportedException("Query type is not supported.");
+                }
+            }
+        }
         private OrganizationResponse ToOrgResponse(OrganizationRequest orgRequest, HttpResponseMessage result)
         {
             if (result.StatusCode == HttpStatusCode.InternalServerError)
             {
                 var body = result.Content.ReadAsStringAsync().Result;
+                throw new Exception("Error from Web API.");
             }
 
             var json = result.Content.ReadAsStringAsync().Result;
@@ -196,23 +238,43 @@
                 }
                 case RetrieveMultipleRequest request:
                 {
-                    if (request.Query is QueryExpression query)
+                    EntityMetadata metadata;
+                    switch (request.Query)
                     {
-                        var metadata = _metadata[query.EntityName];
-                        var converters = new JsonConverter[] {
-                            new EntityConverter(metadata),
-                            new EntityCollectionConverter(metadata)
-                        };
-                        var collection = JsonConvert.DeserializeObject<EntityCollection>(json, converters);
 
-                        var response = new RetrieveMultipleResponse();
-                        response.Results["EntityCollection"] = collection;
-                        return response;
+                        case QueryExpression query:
+                        {
+                            metadata = _metadata[query.EntityName];
+                            break;
+                        }
+                        case QueryByAttribute query:
+                        {
+                            metadata = _metadata[query.EntityName];
+                            break;
+                        }
+                        case FetchExpression query:
+                        {
+                            using (var input = new StringReader(query.Query))
+                            using (var reader = XmlReader.Create(input))
+                            {
+                                reader.ReadToFollowing("entity");
+                                var entityName = reader.GetAttribute("name");
+                                metadata = _metadata[entityName];
+                                break;
+                            }
+                        }
+                        default:
+                        {
+                            throw new NotSupportedException("Query type is not supported.");
+                        }
                     }
-                    else
-                    {
-                        throw new NotSupportedException("Query type is not supported.");
-                    }
+
+                    var converters = new JsonConverter[] { new EntityConverter(metadata), new EntityCollectionConverter(metadata) };
+                    var collection = JsonConvert.DeserializeObject<EntityCollection>(json, converters);
+
+                    var response = new RetrieveMultipleResponse();
+                    response.Results["EntityCollection"] = collection;
+                    return response;
                 }
                 case CreateRequest request:
                 {
